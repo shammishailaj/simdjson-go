@@ -1,3 +1,7 @@
+//+build !noasm
+//+build !appengine
+//+build gc
+
 /*
  * MinIO Cloud Storage, (C) 2020 MinIO, Inc.
  *
@@ -18,6 +22,8 @@ package simdjson
 
 import (
 	"sync/atomic"
+
+	"github.com/klauspost/cpuid"
 )
 
 func json_markup(b byte) bool {
@@ -25,6 +31,11 @@ func json_markup(b byte) bool {
 }
 
 func find_structural_indices(buf []byte, pj *internalParsedJson) bool {
+
+	f := find_structural_bits_in_slice
+	if cpuid.CPU.AVX512F() {
+		f = find_structural_bits_in_slice_avx512
+	}
 
 	// persistent state across loop
 	// does the last iteration end with an odd-length sequence of backslashes?
@@ -39,13 +50,6 @@ func find_structural_indices(buf []byte, pj *internalParsedJson) bool {
 	// effectively the very first char is considered to follow "whitespace" for the
 	// purposes of pseudo-structural character detection so we initialize to 1
 	prev_iter_ends_pseudo_pred := uint64(1)
-
-	// structurals are persistent state across loop as we flatten them on the
-	// subsequent iteration into our array.
-	// This is harmless on the first iteration as structurals == 0
-	// and is done for performance reasons; we can hide some of the latency of the
-	// expensive carryless multiply in the previous step with this work
-	structurals := uint64(0)
 
 	error_mask := uint64(0) // for unescaped characters within strings (ASCII code points < 0x20)
 
@@ -72,21 +76,19 @@ func find_structural_indices(buf []byte, pj *internalParsedJson) bool {
 			stripped_index = ^uint64(0)
 		}
 
-		processed := find_structural_bits_in_slice(buf[:len(buf) & ^63], &prev_iter_ends_odd_backslash,
+		processed := f(buf[:len(buf) & ^63], &prev_iter_ends_odd_backslash,
 			&prev_iter_inside_quote, &error_mask,
-			structurals,
 			&prev_iter_ends_pseudo_pred,
 			index.indexes, &index.length, &carried, &position, pj.ndjson)
 
 		// Check if we have at most a single iteration of 64 bytes left, tag on to previous invocation
-		if uint64(len(buf)) - processed <= 64 {
+		if uint64(len(buf))-processed <= 64 {
 			// Process last 64 bytes in larger buffer (to safeguard against reading beyond the end of the buffer)
 			paddedBuf := [128]byte{}
 			copy(paddedBuf[:], buf[processed:])
-			paddedBytes := uint64(len(buf))-processed
-			processed += find_structural_bits_in_slice(paddedBuf[:paddedBytes], &prev_iter_ends_odd_backslash,
+			paddedBytes := uint64(len(buf)) - processed
+			processed += f(paddedBuf[:paddedBytes], &prev_iter_ends_odd_backslash,
 				&prev_iter_inside_quote, &error_mask,
-				structurals,
 				&prev_iter_ends_pseudo_pred,
 				index.indexes, &index.length, &carried, &position, pj.ndjson)
 		}

@@ -1,3 +1,7 @@
+//+build !noasm
+//+build !appengine
+//+build gc
+
 /*
  * MinIO Cloud Storage, (C) 2020 MinIO, Inc.
  *
@@ -18,32 +22,10 @@ package simdjson
 
 import (
 	"fmt"
+	"math/bits"
 	"strings"
 	"testing"
 )
-
-const demo_json = `{"Image":{"Width":800,"Height":600,"Title":"View from 15th Floor","Thumbnail":{"Url":"http://www.example.com/image/481989943","Height":125,"Width":100},"Animated":false,"IDs":[116,943,234,38793]}}`
-
-func reverseBinary(input string) string {
-	// Get Unicode code points.
-	n := 0
-	rune := make([]rune, len(input))
-	for _, r := range input {
-		rune[n] = r
-		n++
-	}
-	rune = rune[0:n]
-	// Reverse
-	for i := 0; i < n/2; i++ {
-		rune[i], rune[n-1-i] = rune[n-1-i], rune[i]
-	}
-	// Convert back to UTF-8.
-	output := string(rune)
-	if len(output) < 64 {
-		output = output + strings.Repeat("0", 64-len(output))
-	}
-	return output
-}
 
 func TestStage1FindMarks(t *testing.T) {
 
@@ -73,7 +55,7 @@ func TestStage1FindMarks(t *testing.T) {
 	quote_bits := uint64(0)
 	prev_iter_inside_quote, error_mask := uint64(0), uint64(0)
 	quote_mask := find_quote_mask_and_bits([]byte(demo_json), odd_ends, &prev_iter_inside_quote, &quote_bits, &error_mask)
-	quoted := reverseBinary(fmt.Sprintf("%b", quote_mask))
+	quoted := fmt.Sprintf("%064b", bits.Reverse64(quote_mask))
 	if quoted != testCases[0].quoted {
 		t.Errorf("TestStage1FindMarks: got: %s want: %s", quoted, testCases[0].quoted)
 	}
@@ -82,11 +64,11 @@ func TestStage1FindMarks(t *testing.T) {
 	whitespace_mask := uint64(0)
 	find_whitespace_and_structurals([]byte(demo_json), &whitespace_mask, &structurals_mask)
 
-	structurals := reverseBinary(fmt.Sprintf("%b", structurals_mask))
+	structurals := fmt.Sprintf("%064b", bits.Reverse64(structurals_mask))
 	if structurals != testCases[0].structurals {
 		t.Errorf("TestStage1FindMarks: got: %s want: %s", structurals, testCases[0].structurals)
 	}
-	whitespace := reverseBinary(fmt.Sprintf("%b", whitespace_mask))
+	whitespace := fmt.Sprintf("%064b", bits.Reverse64(whitespace_mask))
 	if whitespace != testCases[0].whitespace {
 		t.Errorf("TestStage1FindMarks: got: %s want: %s", whitespace, testCases[0].whitespace)
 	}
@@ -95,7 +77,7 @@ func TestStage1FindMarks(t *testing.T) {
 	prev_iter_ends_pseudo_pred := uint64(0)
 	structurals_mask = finalize_structurals(structurals_mask, whitespace_mask, quote_mask, quote_bits, &prev_iter_ends_pseudo_pred)
 
-	structural_finalized := reverseBinary(fmt.Sprintf("%b", structurals_mask))
+	structural_finalized := fmt.Sprintf("%064b", bits.Reverse64(structurals_mask))
 	if structural_finalized != testCases[0].structurals_finalized {
 		t.Errorf("TestStage1FindMarks: got: %s want: %s", structural_finalized, testCases[0].structurals_finalized)
 	}
@@ -176,8 +158,7 @@ func TestFindStructuralIndices(t *testing.T) {
 }
 
 func BenchmarkStage1(b *testing.B) {
-
-	_, _, msg := loadCompressed(b, "twitter")
+	msg := loadCompressed(b, "twitter")
 
 	b.SetBytes(int64(len(msg)))
 	b.ReportAllocs()

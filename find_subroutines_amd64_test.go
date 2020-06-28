@@ -1,3 +1,7 @@
+//+build !noasm
+//+build !appengine
+//+build gc
+
 /*
  * MinIO Cloud Storage, (C) 2020 MinIO, Inc.
  *
@@ -18,8 +22,12 @@ package simdjson
 
 import (
 	"reflect"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/klauspost/cpuid"
 )
 
 func TestFinalizeStructurals(t *testing.T) {
@@ -61,7 +69,7 @@ func TestFinalizeStructurals(t *testing.T) {
 	}
 }
 
-func TestFindNewlineDelimiters(t *testing.T) {
+func testFindNewlineDelimiters(t *testing.T, f func([]byte, uint64) uint64) {
 
 	want := []uint64{
 		0b0000000000000000000000000000000000000000000000000000000000000000,
@@ -75,15 +83,26 @@ func TestFindNewlineDelimiters(t *testing.T) {
 		0b0000000000000000000000000000000000000000000000000000000000000000,
 	}
 
-	for offset := 0; offset < len(demo_ndjson) - 64; offset += 64 {
-		mask := _find_newline_delimiters([]byte(demo_ndjson)[offset:], 0)
-		if mask != want[offset >> 6] {
-			t.Errorf("TestFindNewlineDelimiters: got: %064b want: %064b", mask, want[offset >> 6])
+	for offset := 0; offset < len(demo_ndjson)-64; offset += 64 {
+		mask := f([]byte(demo_ndjson)[offset:], 0)
+		if mask != want[offset>>6] {
+			t.Errorf("testFindNewlineDelimiters: got: %064b want: %064b", mask, want[offset>>6])
 		}
 	}
 }
 
-func TestExcludeNewlineDelimitersWithinQuotes(t *testing.T) {
+func TestFindNewlineDelimiters(t *testing.T) {
+	t.Run("avx2", func(t *testing.T) {
+		testFindNewlineDelimiters(t, _find_newline_delimiters)
+	})
+	if cpuid.CPU.AVX512F() {
+		t.Run("avx512", func(t *testing.T) {
+			testFindNewlineDelimiters(t, _find_newline_delimiters_avx512)
+		})
+	}
+}
+
+func testExcludeNewlineDelimitersWithinQuotes(t *testing.T, f func([]byte, uint64) uint64) {
 
 	input := []byte(`  "-------------------------------------"                       `)
 	input[10] = 0x0a // within quoted string, so should be ignored
@@ -94,15 +113,27 @@ func TestExcludeNewlineDelimitersWithinQuotes(t *testing.T) {
 	odd_ends := uint64(0)
 	quotemask := find_quote_mask_and_bits(input, odd_ends, &prev_iter_inside_quote, &quote_bits, &error_mask)
 
-	mask := _find_newline_delimiters(input, quotemask)
+	mask := f(input, quotemask)
 	want := uint64(1 << 50)
 
 	if mask != want {
-		t.Errorf("TestExcludeNewlineDelimitersWithinQuotes: got: %064b want: %064b", mask, want)
+		t.Errorf("testExcludeNewlineDelimitersWithinQuotes: got: %064b want: %064b", mask, want)
 	}
 }
 
-func TestFindOddBackslashSequences(t *testing.T) {
+func TestExcludeNewlineDelimitersWithinQuotes(t *testing.T) {
+	t.Run("avx2", func(t *testing.T) {
+		testExcludeNewlineDelimitersWithinQuotes(t, _find_newline_delimiters)
+	})
+	if cpuid.CPU.AVX512F() {
+		t.Run("avx512", func(t *testing.T) {
+			testExcludeNewlineDelimitersWithinQuotes(t, _find_newline_delimiters_avx512)
+		})
+	}
+
+}
+
+func testFindOddBackslashSequences(t *testing.T, f func([]byte, *uint64) uint64) {
 
 	testCases := []struct {
 		prev_ends_odd      uint64
@@ -127,14 +158,14 @@ func TestFindOddBackslashSequences(t *testing.T) {
 
 	for i, tc := range testCases {
 		prev_iter_ends_odd_backslash := tc.prev_ends_odd
-		mask := find_odd_backslash_sequences([]byte(tc.input), &prev_iter_ends_odd_backslash)
+		mask := f([]byte(tc.input), &prev_iter_ends_odd_backslash)
 
 		if mask != tc.expected {
-			t.Errorf("TestFindOddBackslashSequences(%d): got: 0x%x want: 0x%x", i, mask, tc.expected)
+			t.Errorf("testFindOddBackslashSequences(%d): got: 0x%x want: 0x%x", i, mask, tc.expected)
 		}
 
 		if prev_iter_ends_odd_backslash != tc.ends_odd_backslash {
-			t.Errorf("TestFindOddBackslashSequences(%d): got: %v want: %v", i, prev_iter_ends_odd_backslash, tc.ends_odd_backslash)
+			t.Errorf("testFindOddBackslashSequences(%d): got: %v want: %v", i, prev_iter_ends_odd_backslash, tc.ends_odd_backslash)
 		}
 	}
 
@@ -143,50 +174,134 @@ func TestFindOddBackslashSequences(t *testing.T) {
 		test := strings.Repeat(" ", int(i-1)) + `\"` + strings.Repeat(" ", 62+64)
 
 		prev_iter_ends_odd_backslash := uint64(0)
-		mask_lo := find_odd_backslash_sequences([]byte(test), &prev_iter_ends_odd_backslash)
-		mask_hi := find_odd_backslash_sequences([]byte(test[64:]), &prev_iter_ends_odd_backslash)
+		mask_lo := f([]byte(test), &prev_iter_ends_odd_backslash)
+		mask_hi := f([]byte(test[64:]), &prev_iter_ends_odd_backslash)
 
 		if i < 64 {
 			if mask_lo != 1<<i || mask_hi != 0 {
-				t.Errorf("TestFindOddBackslashSequences(%d): got: lo = 0x%x; hi = 0x%x  want: 0x%x 0x0", i, mask_lo, mask_hi, 1<<i)
+				t.Errorf("testFindOddBackslashSequences(%d): got: lo = 0x%x; hi = 0x%x  want: 0x%x 0x0", i, mask_lo, mask_hi, 1<<i)
 			}
 		} else {
 			if mask_lo != 0 || mask_hi != 1<<(i-64) {
-				t.Errorf("TestFindOddBackslashSequences(%d): got: lo = 0x%x; hi = 0x%x  want:  0x0 0x%x", i, mask_lo, mask_hi, 1<<(i-64))
+				t.Errorf("testFindOddBackslashSequences(%d): got: lo = 0x%x; hi = 0x%x  want:  0x0 0x%x", i, mask_lo, mask_hi, 1<<(i-64))
 			}
+		}
+	}
+}
+
+func TestFindOddBackslashSequences(t *testing.T) {
+	t.Run("avx2", func(t *testing.T) {
+		testFindOddBackslashSequences(t, find_odd_backslash_sequences)
+	})
+	if cpuid.CPU.AVX512F() {
+		t.Run("avx512", func(t *testing.T) {
+			testFindOddBackslashSequences(t, find_odd_backslash_sequences_avx512)
+		})
+	}
+}
+
+func testFindQuoteMaskAndBits(t *testing.T, f func([]byte, uint64, *uint64, *uint64, *uint64) uint64) {
+
+	testCases := []struct {
+		inputOE      uint64 // odd_ends
+		input        string
+		expected     uint64
+		expectedQB   uint64 // quote_bits
+		expectedPIIQ uint64 // prev_iter_inside_quote
+		expectedEM   uint64 // error_mask
+	}{
+		{0x0, `  ""                                                            `, 0x4, 0xc, 0 ,0},
+		{0x0, `  "-"                                                           `, 0xc, 0x14, 0 ,0},
+		{0x0, `  "--"                                                          `, 0x1c, 0x24, 0 ,0},
+		{0x0, `  "---"                                                         `, 0x3c, 0x44, 0 ,0},
+		{0x0, `  "-------------"                                               `, 0xfffc, 0x10004, 0 ,0},
+		{0x0, `  "---------------------------------------"                     `, 0x3fffffffffc, 0x40000000004, 0 ,0},
+		{0x0, `"--------------------------------------------------------------"`, 0x7fffffffffffffff, 0x8000000000000001, 0 ,0},
+
+		// quote is not closed --> prev_iter_inside_quote should be set
+		{0x0, `                                                            "---`, 0xf000000000000000, 0x1000000000000000, ^uint64(0) ,0},
+		{0x0, `                                                            "", `, 0x1000000000000000, 0x3000000000000000, 0 ,0},
+		{0x0, `                                                            "-",`, 0x3000000000000000, 0x5000000000000000, 0 ,0},
+		{0x0, `                                                            "--"`, 0x7000000000000000, 0x9000000000000000, 0 ,0},
+		{0x0, `                                                            "---`, 0xf000000000000000, 0x1000000000000000, ^uint64(0),0},
+
+		// test previous mask ending in backslash
+		{0x1, `"                                                               `, 0x0, 0x0, 0x0,0x0},
+		{0x1, `"""                                                             `, 0x2, 0x6, 0x0 ,0x0},
+		{0x0, `"                                                               `, 0xffffffffffffffff, 0x1, ^uint64(0),0x0},
+		{0x0, `"""                                                             `, 0xfffffffffffffffd, 0x7, ^uint64(0), 0x0},
+
+		// test invalid chars (< 0x20) that are enclosed in quotes
+		{0x0, `"` + string([]byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31}) + ` "                             `, 0x3ffffffff, 0x400000001, 0, 0x1fffffffe},
+		{0x0, `"` + string([]byte{0, 32, 1, 32, 2, 32, 3, 32, 4, 32, 5, 32, 6, 32, 7, 32, 8, 32, 9, 32, 10, 32, 11, 32, 12, 32, 13, 32, 14, 32, 15, 32, 16, 32, 17, 32, 18, 32, 19, 32, 20, 32, 21, 32, 22, 32, 23, 32, 24, 32, 25, 32, 26, 32, 27, 32, 28, 32, 29, 32, 31}) + ` "`, 0x7fffffffffffffff, 0x8000000000000001, 0, 0x2aaaaaaaaaaaaaaa},
+		{0x0, `" ` + string([]byte{0, 32, 1, 32, 2, 32, 3, 32, 4, 32, 5, 32, 6, 32, 7, 32, 8, 32, 9, 32, 10, 32, 11, 32, 12, 32, 13, 32, 14, 32, 15, 32, 16, 32, 17, 32, 18, 32, 19, 32, 20, 32, 21, 32, 22, 32, 23, 32, 24, 32, 25, 32, 26, 32, 27, 32, 28, 32, 29, 32, 31}) + `"`, 0x7fffffffffffffff, 0x8000000000000001, 0, 0x5555555555555554},
+	}
+
+	for i, tc := range testCases {
+
+		prev_iter_inside_quote, quote_bits, error_mask := uint64(0), uint64(0), uint64(0)
+
+		mask := f([]byte(tc.input), tc.inputOE, &prev_iter_inside_quote, &quote_bits, &error_mask)
+
+		if mask != tc.expected {
+			t.Errorf("testFindQuoteMaskAndBits(%d): got: 0x%x want: 0x%x", i, mask, tc.expected)
+		}
+
+		if quote_bits != tc.expectedQB {
+			t.Errorf("testFindQuoteMaskAndBits(%d): got quote_bits: 0x%x want: 0x%x", i, quote_bits, tc.expectedQB)
+		}
+
+		if prev_iter_inside_quote != tc.expectedPIIQ {
+			t.Errorf("testFindQuoteMaskAndBits(%d): got prev_iter_inside_quote: 0x%x want: 0x%x", i, prev_iter_inside_quote, tc.expectedPIIQ)
+		}
+
+		if error_mask != tc.expectedEM {
+			t.Errorf("testFindQuoteMaskAndBits(%d): got error_mask: 0x%x want: 0x%x", i, error_mask, tc.expectedEM)
+		}
+	}
+
+	testCasesPIIQ := []struct {
+		inputPIIQ    uint64
+		input        string
+		expectedPIIQ uint64
+	}{
+		// prev_iter_inside_quote state remains unchanged
+		{ uint64(0), `----------------------------------------------------------------`, uint64(0)},
+		{ ^uint64(0), `----------------------------------------------------------------`, ^uint64(0)},
+
+		// prev_iter_inside_quote state remains flips
+		{ uint64(0), `---------------------------"------------------------------------`, ^uint64(0)},
+		{ ^uint64(0), `---------------------------"------------------------------------`, uint64(0)},
+
+		// prev_iter_inside_quote state remains flips twice (thus unchanged)
+		{ uint64(0), `----------------"------------------------"----------------------`, uint64(0)},
+		{ ^uint64(0), `----------------"------------------------"----------------------`, ^uint64(0)},
+	}
+
+	for i, tc := range testCasesPIIQ {
+
+		prev_iter_inside_quote, quote_bits, error_mask := tc.inputPIIQ, uint64(0), uint64(0)
+
+		f([]byte(tc.input), 0, &prev_iter_inside_quote, &quote_bits, &error_mask)
+
+		if prev_iter_inside_quote != tc.expectedPIIQ {
+			t.Errorf("testFindQuoteMaskAndBits(%d): got prev_iter_inside_quote: 0x%x want: 0x%x", i, prev_iter_inside_quote, tc.expectedPIIQ)
 		}
 	}
 }
 
 func TestFindQuoteMaskAndBits(t *testing.T) {
-
-	testCases := []struct {
-		input    string
-		expected uint64
-	}{
-		{`  ""                                                              `, 0x4},
-		{`  "-"                                                             `, 0xc},
-		{`  "--"                                                            `, 0x1c},
-		{`  "---"                                                           `, 0x3c},
-		{`  "-------------"                                                 `, 0xfffc},
-		{`  "---------------------------------------"                       `, 0x3fffffffffc},
-		{`"----------------------------------------------------------------"`, 0xffffffffffffffff},
-	}
-
-	for i, tc := range testCases {
-
-		odd_ends := uint64(0)
-		prev_iter_inside_quote, quote_bits, error_mask := uint64(0), uint64(0), uint64(0)
-
-		mask := find_quote_mask_and_bits([]byte(tc.input), odd_ends, &prev_iter_inside_quote, &quote_bits, &error_mask)
-
-		if mask != tc.expected {
-			t.Errorf("TestFindOddBackslashSequences(%d): got: 0x%x want: 0x%x", i, mask, tc.expected)
-		}
+	t.Run("avx2", func(t *testing.T) {
+		testFindQuoteMaskAndBits(t, find_quote_mask_and_bits)
+	})
+	if cpuid.CPU.AVX512F() {
+		t.Run("avx512", func(t *testing.T) {
+			testFindQuoteMaskAndBits(t, find_quote_mask_and_bits_avx512)
+		})
 	}
 }
 
-func TestFindStructuralBits(t *testing.T) {
+func testFindStructuralBits(t *testing.T, f func([]byte, *uint64, *uint64, *uint64, uint64, *uint64) uint64) {
 
 	testCases := []struct {
 		input string
@@ -212,7 +327,7 @@ func TestFindStructuralBits(t *testing.T) {
 	for i, tc := range testCases {
 
 		// Call assembly routines as a single method
-		structurals := find_structural_bits([]byte(tc.input), &prev_iter_ends_odd_backslash,
+		structurals := f([]byte(tc.input), &prev_iter_ends_odd_backslash,
 			&prev_iter_inside_quote, &error_mask,
 			structurals,
 			&prev_iter_ends_pseudo_pred)
@@ -230,7 +345,18 @@ func TestFindStructuralBits(t *testing.T) {
 	}
 }
 
-func TestFindStructuralBitsWhitespacePadding(t *testing.T) {
+func TestFindStructuralBits(t *testing.T) {
+	t.Run("avx2", func(t *testing.T) {
+		testFindStructuralBits(t, find_structural_bits)
+	})
+	if cpuid.CPU.AVX512F() {
+		t.Run("avx512", func(t *testing.T) {
+			testFindStructuralBits(t, find_structural_bits_avx512)
+		})
+	}
+}
+
+func testFindStructuralBitsWhitespacePadding(t *testing.T, f func([]byte, *uint64, *uint64, *uint64, *uint64, *[INDEX_SIZE]uint32, *int, *uint64, *uint64, uint64) uint64) {
 
 	// Test whitespace padding (for partial load of last 64 bytes) with
 	// string full of structural characters
@@ -242,7 +368,6 @@ func TestFindStructuralBitsWhitespacePadding(t *testing.T) {
 		prev_iter_inside_quote := uint64(0) // either all zeros or all ones
 		prev_iter_ends_pseudo_pred := uint64(1)
 		error_mask := uint64(0) // for unescaped characters within strings (ASCII code points < 0x20)
-		structurals := uint64(0)
 		carried := ^uint64(0)
 		position := ^uint64(0)
 
@@ -251,15 +376,14 @@ func TestFindStructuralBitsWhitespacePadding(t *testing.T) {
 
 		processed := find_structural_bits_in_slice([]byte(msg[:l]), &prev_iter_ends_odd_backslash,
 			&prev_iter_inside_quote, &error_mask,
-			structurals,
 			&prev_iter_ends_pseudo_pred,
 			index.indexes, &index.length, &carried, &position, 0)
 
 		if processed != uint64(l) {
-			t.Errorf("TestFindStructuralBitsWhitespacePadding(%d): got: %d want: %d", l, processed, l)
+			t.Errorf("testFindStructuralBitsWhitespacePadding(%d): got: %d want: %d", l, processed, l)
 		}
 		if index.length != l {
-			t.Errorf("TestFindStructuralBitsWhitespacePadding(%d): got: %d want: %d", l, index.length, l)
+			t.Errorf("testFindStructuralBitsWhitespacePadding(%d): got: %d want: %d", l, index.length, l)
 		}
 
 		// Compute offset of last (structural) character and verify it points to the end of the message
@@ -269,24 +393,34 @@ func TestFindStructuralBitsWhitespacePadding(t *testing.T) {
 		}
 		if l > 0 {
 			if lastChar != uint64(l-1) {
-				t.Errorf("TestFindStructuralBitsWhitespacePadding(%d): got: %d want: %d", l, lastChar, uint64(l-1))
+				t.Errorf("testFindStructuralBitsWhitespacePadding(%d): got: %d want: %d", l, lastChar, uint64(l-1))
 			}
 		} else {
 			if lastChar != uint64(l-1)-carried {
-				t.Errorf("TestFindStructuralBitsWhitespacePadding(%d): got: %d want: %d", l, lastChar, uint64(l-1)-carried)
+				t.Errorf("testFindStructuralBitsWhitespacePadding(%d): got: %d want: %d", l, lastChar, uint64(l-1)-carried)
 			}
 		}
 	}
 }
 
-func TestFindStructuralBitsLoop(t *testing.T) {
-	_, _, msg := loadCompressed(t, "twitter")
+func TestFindStructuralBitsWhitespacePadding(t *testing.T) {
+	t.Run("avx2", func(t *testing.T) {
+		testFindStructuralBitsWhitespacePadding(t, find_structural_bits_in_slice)
+	})
+	if cpuid.CPU.AVX512F() {
+		t.Run("avx512", func(t *testing.T) {
+			testFindStructuralBitsWhitespacePadding(t, find_structural_bits_in_slice_avx512)
+		})
+	}
+}
+
+func testFindStructuralBitsLoop(t *testing.T, f func([]byte, *uint64, *uint64, *uint64, *uint64, *[INDEX_SIZE]uint32, *int, *uint64, *uint64, uint64) uint64) {
+	msg := loadCompressed(t, "twitter")
 
 	prev_iter_ends_odd_backslash := uint64(0)
 	prev_iter_inside_quote := uint64(0) // either all zeros or all ones
 	prev_iter_ends_pseudo_pred := uint64(1)
 	error_mask := uint64(0) // for unescaped characters within strings (ASCII code points < 0x20)
-	structurals := uint64(0)
 	carried := ^uint64(0)
 	position := ^uint64(0)
 
@@ -296,9 +430,8 @@ func TestFindStructuralBitsLoop(t *testing.T) {
 		index := indexChan{}
 		index.indexes = &[INDEX_SIZE]uint32{}
 
-		processed += find_structural_bits_in_slice(msg[processed:], &prev_iter_ends_odd_backslash,
+		processed += f(msg[processed:], &prev_iter_ends_odd_backslash,
 			&prev_iter_inside_quote, &error_mask,
-			structurals,
 			&prev_iter_ends_pseudo_pred,
 			index.indexes, &index.length, &carried, &position, 0)
 
@@ -325,7 +458,18 @@ func TestFindStructuralBitsLoop(t *testing.T) {
 	}
 }
 
-func BenchmarkFindStructuralBits(b *testing.B) {
+func TestFindStructuralBitsLoop(t *testing.T) {
+	t.Run("avx2", func(t *testing.T) {
+		testFindStructuralBitsLoop(t, find_structural_bits_in_slice)
+	})
+	if cpuid.CPU.AVX512F() {
+		t.Run("avx512", func(t *testing.T) {
+			testFindStructuralBitsLoop(t, find_structural_bits_in_slice_avx512)
+		})
+	}
+}
+
+func benchmarkFindStructuralBits(b *testing.B, f func([]byte, *uint64, *uint64, *uint64, uint64, *uint64) uint64) {
 
 	const msg = "                                                                "
 	b.SetBytes(int64(len(msg)))
@@ -339,10 +483,108 @@ func BenchmarkFindStructuralBits(b *testing.B) {
 	structurals := uint64(0)
 
 	for i := 0; i < b.N; i++ {
-		find_structural_bits([]byte(msg), &prev_iter_ends_odd_backslash,
+		f([]byte(msg), &prev_iter_ends_odd_backslash,
 			&prev_iter_inside_quote, &error_mask,
 			structurals,
 			&prev_iter_ends_pseudo_pred)
+	}
+}
+
+func BenchmarkFindStructuralBits(b *testing.B) {
+	b.Run("avx2", func(b *testing.B) {
+		benchmarkFindStructuralBits(b, find_structural_bits)
+	})
+	if cpuid.CPU.AVX512F() {
+		b.Run("avx512", func(b *testing.B) {
+			benchmarkFindStructuralBits(b, find_structural_bits_avx512)
+		})
+	}
+}
+
+func benchmarkFindStructuralBitsLoop(b *testing.B, f func([]byte, *uint64, *uint64, *uint64, *uint64, *[INDEX_SIZE]uint32, *int, *uint64, *uint64, uint64) uint64) {
+
+	msg := loadCompressed(b, "twitter")
+
+	prev_iter_ends_odd_backslash := uint64(0)
+	prev_iter_inside_quote := uint64(0) // either all zeros or all ones
+	prev_iter_ends_pseudo_pred := uint64(1)
+	error_mask := uint64(0) // for unescaped characters within strings (ASCII code points < 0x20)
+	carried := ^uint64(0)
+	position := ^uint64(0)
+
+	b.SetBytes(int64(len(msg)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+
+		for processed := uint64(0); processed < uint64(len(msg)); {
+			index := indexChan{}
+			index.indexes = &[INDEX_SIZE]uint32{}
+
+			processed += f(msg[processed:], &prev_iter_ends_odd_backslash,
+				&prev_iter_inside_quote, &error_mask,
+				&prev_iter_ends_pseudo_pred,
+				index.indexes, &index.length, &carried, &position, 0)
+		}
+	}
+}
+
+func BenchmarkFindStructuralBitsLoop(b *testing.B) {
+	b.Run("avx2", func(b *testing.B) {
+		benchmarkFindStructuralBitsLoop(b, find_structural_bits_in_slice)
+	})
+	if cpuid.CPU.AVX512F() {
+		b.Run("avx512", func(b *testing.B) {
+			benchmarkFindStructuralBitsLoop(b, find_structural_bits_in_slice_avx512)
+		})
+	}
+}
+
+func benchmarkFindStructuralBitsParallelLoop(b *testing.B, f func([]byte, *uint64, *uint64, *uint64, *uint64, *[INDEX_SIZE]uint32, *int, *uint64, *uint64, uint64) uint64) {
+
+	msg := loadCompressed(b, "twitter")
+	cpus := runtime.NumCPU()
+
+	b.SetBytes(int64(len(msg) * cpus))
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		var wg sync.WaitGroup
+		wg.Add(cpus)
+		for cpu := 0; cpu < cpus; cpu++ {
+			go func() {
+				prev_iter_ends_odd_backslash := uint64(0)
+				prev_iter_inside_quote := uint64(0) // either all zeros or all ones
+				prev_iter_ends_pseudo_pred := uint64(1)
+				error_mask := uint64(0) // for unescaped characters within strings (ASCII code points < 0x20)
+				carried := ^uint64(0)
+				position := ^uint64(0)
+
+				for processed := uint64(0); processed < uint64(len(msg)); {
+					index := indexChan{}
+					index.indexes = &[INDEX_SIZE]uint32{}
+
+					processed += f(msg[processed:], &prev_iter_ends_odd_backslash,
+						&prev_iter_inside_quote, &error_mask,
+						&prev_iter_ends_pseudo_pred,
+						index.indexes, &index.length, &carried, &position, 0)
+				}
+				defer wg.Done()
+			}()
+		}
+		wg.Wait()
+	}
+}
+
+func BenchmarkFindStructuralBitsParallelLoop(b *testing.B) {
+	b.Run("avx2", func(b *testing.B) {
+		benchmarkFindStructuralBitsParallelLoop(b, find_structural_bits_in_slice)
+	})
+	if cpuid.CPU.AVX512F() {
+		b.Run("avx512", func(b *testing.B) {
+			benchmarkFindStructuralBitsParallelLoop(b, find_structural_bits_in_slice_avx512)
+		})
 	}
 }
 
@@ -365,7 +607,7 @@ func find_structural_bits_multiple_calls(buf []byte, prev_iter_ends_odd_backslas
 	return finalize_structurals(structurals, whitespace_mask, quote_mask, quote_bits, prev_iter_ends_pseudo_pred)
 }
 
-func TestFindWhitespaceAndStructurals(t *testing.T) {
+func testFindWhitespaceAndStructurals(t *testing.T, f func([]byte, *uint64, *uint64)) {
 
 	testCases := []struct {
 		input          string
@@ -400,15 +642,26 @@ func TestFindWhitespaceAndStructurals(t *testing.T) {
 		whitespace := uint64(0)
 		structurals := uint64(0)
 
-		find_whitespace_and_structurals([]byte(tc.input), &whitespace, &structurals)
+		f([]byte(tc.input), &whitespace, &structurals)
 
 		if whitespace != tc.expected_ws {
-			t.Errorf("TestFindWhitespaceAndStructurals(%d): got: 0x%x want: 0x%x", i, whitespace, tc.expected_ws)
+			t.Errorf("testFindWhitespaceAndStructurals(%d): got: 0x%x want: 0x%x", i, whitespace, tc.expected_ws)
 		}
 
 		if structurals != tc.expected_strls {
-			t.Errorf("TestFindWhitespaceAndStructurals(%d): got: 0x%x want: 0x%x", i, structurals, tc.expected_strls)
+			t.Errorf("testFindWhitespaceAndStructurals(%d): got: 0x%x want: 0x%x", i, structurals, tc.expected_strls)
 		}
+	}
+}
+
+func TestFindWhitespaceAndStructurals(t *testing.T) {
+	t.Run("avx2", func(t *testing.T) {
+		testFindWhitespaceAndStructurals(t, find_whitespace_and_structurals)
+	})
+	if cpuid.CPU.AVX512F() {
+		t.Run("avx512", func(t *testing.T) {
+			testFindWhitespaceAndStructurals(t, find_whitespace_and_structurals_avx512)
+		})
 	}
 }
 
@@ -480,7 +733,7 @@ func TestFlattenBitsIncremental(t *testing.T) {
 
 func BenchmarkFlattenBits(b *testing.B) {
 
-	_, _, msg := loadCompressed(b, "twitter")
+	msg := loadCompressed(b, "twitter")
 
 	prev_iter_ends_odd_backslash := uint64(0)
 	prev_iter_inside_quote := uint64(0) // either all zeros or all ones
@@ -516,6 +769,3 @@ func BenchmarkFlattenBits(b *testing.B) {
 		}
 	}
 }
-
-
-

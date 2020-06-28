@@ -17,7 +17,6 @@
 package simdjson
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -25,7 +24,6 @@ import (
 	"io/ioutil"
 	"math"
 	"strconv"
-	"sync"
 )
 
 //
@@ -43,6 +41,7 @@ import (
 const GOLANG_NUMBER_PARSING = true
 
 const JSONVALUEMASK = 0xffffffffffffff
+const JSONTAGMASK = 0xff << 56
 const STRINGBUFBIT = 0x80000000000000
 const STRINGBUFMASK = 0x7fffffffffffff
 
@@ -58,7 +57,7 @@ type ParsedJson struct {
 }
 
 const INDEX_SLOTS = 16
-const INDEX_SIZE = 1536 							   // Seems to be a good size for the index buffering
+const INDEX_SIZE = 1536                                // Seems to be a good size for the index buffering
 const INDEX_SIZE_WITH_SAFETY_BUFFER = INDEX_SIZE - 128 // Make sure we never write beyond buffer
 
 type indexChan struct {
@@ -72,87 +71,10 @@ type internalParsedJson struct {
 	containing_scope_offset []uint64
 	isvalid                 bool
 	index_chan              chan indexChan
-	indexesChan 			indexChan
+	indexesChan             indexChan
 	buffers                 [INDEX_SLOTS][INDEX_SIZE]uint32
 	buffers_offset          uint64
 	ndjson                  uint64
-}
-
-func (pj *internalParsedJson) initialize(size int) {
-	// Estimate the tape size to be about 15% of the length of the JSON message
-	avgTapeSize := size * 15 / 100
-	if cap(pj.Tape) < avgTapeSize {
-		pj.Tape = make([]uint64, 0, avgTapeSize)
-	}
-	pj.Tape = pj.Tape[:0]
-
-	stringsSize := size / 10
-	if stringsSize < 128 {
-		stringsSize = 128 // always allocate at least 128 for the string buffer
-	}
-	if cap(pj.Strings) < stringsSize {
-		pj.Strings = make([]byte, 0, stringsSize)
-	}
-	pj.Strings = pj.Strings[:0]
-	if cap(pj.containing_scope_offset) < DEFAULTDEPTH {
-		pj.containing_scope_offset = make([]uint64, 0, DEFAULTDEPTH)
-	}
-	pj.containing_scope_offset = pj.containing_scope_offset[:0]
-}
-
-func (pj *internalParsedJson) parseMessage(msg []byte) error {
-	return pj.parseMessageInternal(msg, false)
-}
-
-func (pj *internalParsedJson) parseMessageNdjson(msg []byte) error {
-	return pj.parseMessageInternal(msg, true)
-}
-
-func (pj *internalParsedJson) parseMessageInternal(msg []byte, ndjson bool) (err error) {
-
-	// Cache message so we can point directly to strings
-	// TODO: Find out why TestVerifyTape/instruments fails without bytes.TrimSpace
-	pj.Message = bytes.TrimSpace(msg)
-	pj.initialize(len(pj.Message))
-
-	if ndjson {
-		pj.ndjson = 1
-	} else {
-		pj.ndjson = 0
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	// Make the capacity of the channel smaller than the number of slots.
-	// This way the sender will automatically block until the consumer
-	// has finished the slot it is working on.
-	pj.index_chan = make(chan indexChan, INDEX_SLOTS-2)
-	pj.buffers_offset = ^uint64(0)
-
-	var errStage1 error
-	go func() {
-		if !find_structural_indices(pj.Message, pj) {
-			errStage1 = errors.New("Failed to find all structural indices for stage 1")
-		}
-		wg.Done()
-	}()
-	go func() {
-		if !unified_machine(pj.Message, pj) {
-			err = errors.New("Bad parsing while executing stage 2")
-			// drain the channel until empty
-			for range pj.index_chan {
-			}
-		}
-		wg.Done()
-	}()
-
-	wg.Wait()
-
-	if errStage1 != nil {
-		return errStage1
-	}
-	return
 }
 
 // Iter returns a new Iter.
@@ -881,6 +803,12 @@ const (
 	TagRoot        = Tag('r')
 	TagEnd         = Tag(0)
 )
+
+var tagOpenToClose = [256]Tag{
+	TagObjectStart: TagObjectEnd,
+	TagArrayStart:  TagArrayEnd,
+	TagRoot:        TagRoot,
+}
 
 func (t Tag) String() string {
 	return string([]byte{byte(t)})

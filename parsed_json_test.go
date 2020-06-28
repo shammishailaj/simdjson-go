@@ -17,7 +17,6 @@
 package simdjson
 
 import (
-	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"io/ioutil"
@@ -27,31 +26,14 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
+const demo_json = `{"Image":{"Width":800,"Height":600,"Title":"View from 15th Floor","Thumbnail":{"Url":"http://www.example.com/image/481989943","Height":125,"Width":100},"Animated":false,"IDs":[116,943,234,38793]}}`
+
 type tester interface {
 	Fatal(args ...interface{})
 }
 
-func loadCompressed(t tester, file string) (tape, sb, ref []byte) {
+func loadCompressed(t tester, file string) (ref []byte) {
 	dec, err := zstd.NewReader(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tap, err := ioutil.ReadFile(filepath.Join("testdata", file+".tape.zst"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	tap, err = dec.DecodeAll(tap, nil)
-	// Our end-of-root has been incremented by one (past last element) for quick skipping of ndjson
-	// So correct the initial root element to point to one position higher
-	binary.LittleEndian.PutUint64(tap, binary.LittleEndian.Uint64(tap)+1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sb, err = ioutil.ReadFile(filepath.Join("testdata", file+".stringbuf.zst"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	sb, err = dec.DecodeAll(sb, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +46,7 @@ func loadCompressed(t tester, file string) (tape, sb, ref []byte) {
 		t.Fatal(err)
 	}
 
-	return tap, sb, ref
+	return ref
 }
 
 var testCases = []struct {
@@ -139,8 +121,8 @@ func testCTapeCtoGoTapeCompare(t *testing.T, ctape []uint64, csbuf []byte, pj in
 		cval, goval := ctape[cindex], gotape[goindex]
 
 		// Make sure the type is the same between the C and Go version
-		if cval >> 56 != goval >> 56 {
-			t.Errorf("TestCTapeCtoGoTapeCompare: got: %02x want: %02x", goval >> 56, cval >> 56)
+		if cval>>56 != goval>>56 {
+			t.Errorf("TestCTapeCtoGoTapeCompare: got: %02x want: %02x", goval>>56, cval>>56)
 		}
 
 		ntype := Tag(goval >> 56)
@@ -151,9 +133,9 @@ func testCTapeCtoGoTapeCompare(t *testing.T, ctape []uint64, csbuf []byte, pj in
 
 		case TagString:
 			cpayload := cval & JSONVALUEMASK
-			cstrlen := binary.LittleEndian.Uint32(csbuf[cpayload:cpayload+4])
-			cstr := string(csbuf[cpayload+4:cpayload+4+uint64(cstrlen)])
-			gostr, _ := pj.stringAt(goval & JSONVALUEMASK, gotape[goindex+1])
+			cstrlen := binary.LittleEndian.Uint32(csbuf[cpayload : cpayload+4])
+			cstr := string(csbuf[cpayload+4 : cpayload+4+uint64(cstrlen)])
+			gostr, _ := pj.stringAt(goval&JSONVALUEMASK, gotape[goindex+1])
 			if cstr != gostr {
 				t.Errorf("TestCTapeCtoGoTapeCompare: got: %s want: %s", gostr, cstr)
 			}
@@ -184,32 +166,14 @@ func testCTapeCtoGoTapeCompare(t *testing.T, ctape []uint64, csbuf []byte, pj in
 	}
 }
 
-func TestVerifyTape(t *testing.T) {
-
-	for _, tt := range testCases {
-
-		t.Run(tt.name, func(t *testing.T) {
-			cbuf, csbuf, ref := loadCompressed(t, tt.name)
-
-			pj := internalParsedJson{}
-			if err := pj.parseMessage(ref); err != nil {
-				t.Errorf("parseMessage failed: %v\n", err)
-				return
-			}
-
-			ctape := bytesToUint64(cbuf)
-
-			testCTapeCtoGoTapeCompare(t, ctape, csbuf, pj)
-		})
-	}
-}
-
 func BenchmarkIter_MarshalJSONBuffer(b *testing.B) {
+	if !SupportedCPU() {
+		b.SkipNow()
+	}
 	for _, tt := range testCases {
 		b.Run(tt.name, func(b *testing.B) {
-			tap, sb, _ := loadCompressed(b, tt.name)
-
-			pj, err := loadTape(bytes.NewBuffer(tap), bytes.NewBuffer(sb))
+			ref := loadCompressed(b, tt.name)
+			pj, err := Parse(ref, nil)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -236,7 +200,7 @@ func BenchmarkIter_MarshalJSONBuffer(b *testing.B) {
 func BenchmarkGoMarshalJSON(b *testing.B) {
 	for _, tt := range testCases {
 		b.Run(tt.name, func(b *testing.B) {
-			_, _, ref := loadCompressed(b, tt.name)
+			ref := loadCompressed(b, tt.name)
 			var m interface{}
 			m = map[string]interface{}{}
 			if tt.array {
@@ -264,13 +228,15 @@ func BenchmarkGoMarshalJSON(b *testing.B) {
 }
 
 func TestPrintJson(t *testing.T) {
-
+	if !SupportedCPU() {
+		t.SkipNow()
+	}
 	msg := []byte(demo_json)
 	expected := `{"Image":{"Width":800,"Height":600,"Title":"View from 15th Floor","Thumbnail":{"Url":"http://www.example.com/image/481989943","Height":125,"Width":100},"Animated":false,"IDs":[116,943,234,38793]}}`
 
-	pj := internalParsedJson{}
+	pj, err := Parse(msg, nil)
 
-	if err := pj.parseMessage(msg); err != nil {
+	if err != nil {
 		t.Errorf("parseMessage failed\n")
 	}
 

@@ -19,25 +19,29 @@ package simdjson
 import (
 	"encoding/json"
 	"testing"
+
+	jsoniter "github.com/json-iterator/go"
 )
 
 func benchmarkFromFile(b *testing.B, filename string) {
-
-	_, _, msg := loadCompressed(b, filename)
+	if !SupportedCPU() {
+		b.SkipNow()
+	}
+	msg := loadCompressed(b, filename)
 
 	b.SetBytes(int64(len(msg)))
 	b.ReportAllocs()
 	b.ResetTimer()
 
-	pj := internalParsedJson{}
+	pj := &ParsedJson{}
 
 	for i := 0; i < b.N; i++ {
-
 		// Reset tape
-		pj.Tape = pj.Tape[:0]
-		pj.Strings = pj.Strings[:0]
-
-		pj.parseMessage(msg)
+		var err error
+		pj, err = Parse(msg, pj)
+		if err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -56,9 +60,27 @@ func BenchmarkTwitter(b *testing.B)        { benchmarkFromFile(b, "twitter") }
 func BenchmarkTwitterescaped(b *testing.B) { benchmarkFromFile(b, "twitterescaped") }
 func BenchmarkUpdate_center(b *testing.B)  { benchmarkFromFile(b, "update-center") }
 
+func benchmarkJsoniter(b *testing.B, filename string) {
+
+	msg := loadCompressed(b, filename)
+
+	b.SetBytes(int64(len(msg)))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	for i := 0; i < b.N; i++ {
+
+		var parsed interface{}
+		if err := json.Unmarshal(msg, &parsed); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func benchmarkEncodingJson(b *testing.B, filename string) {
 
-	_, _, msg := loadCompressed(b, filename)
+	msg := loadCompressed(b, filename)
 
 	b.SetBytes(int64(len(msg)))
 	b.ReportAllocs()
@@ -66,9 +88,10 @@ func benchmarkEncodingJson(b *testing.B, filename string) {
 
 	for i := 0; i < b.N; i++ {
 
-		var parsed map[string]interface{}
-
-		json.Unmarshal(msg, &parsed)
+		var parsed interface{}
+		if err := json.Unmarshal(msg, &parsed); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -86,3 +109,18 @@ func BenchmarkEncodingJsonRandom(b *testing.B)         { benchmarkEncodingJson(b
 func BenchmarkEncodingJsonTwitter(b *testing.B)        { benchmarkEncodingJson(b, "twitter") }
 func BenchmarkEncodingJsonTwitterescaped(b *testing.B) { benchmarkEncodingJson(b, "twitterescaped") }
 func BenchmarkEncodingJsonUpdate_center(b *testing.B)  { benchmarkEncodingJson(b, "update-center") }
+
+func BenchmarkJsoniterApache_builds(b *testing.B)  { benchmarkJsoniter(b, "apache_builds") }
+func BenchmarkJsoniterCanada(b *testing.B)         { benchmarkJsoniter(b, "canada") }
+func BenchmarkJsoniterCitm_catalog(b *testing.B)   { benchmarkJsoniter(b, "citm_catalog") }
+func BenchmarkJsoniterGithub_events(b *testing.B)  { benchmarkJsoniter(b, "github_events") }
+func BenchmarkJsoniterGsoc_2018(b *testing.B)      { benchmarkJsoniter(b, "gsoc-2018") }
+func BenchmarkJsoniterInstruments(b *testing.B)    { benchmarkJsoniter(b, "instruments") }
+func BenchmarkJsoniterMarine_ik(b *testing.B)      { benchmarkJsoniter(b, "marine_ik") }
+func BenchmarkJsoniterMesh(b *testing.B)           { benchmarkJsoniter(b, "mesh") }
+func BenchmarkJsoniterMesh_pretty(b *testing.B)    { benchmarkJsoniter(b, "mesh.pretty") }
+func BenchmarkJsoniterNumbers(b *testing.B)        { benchmarkJsoniter(b, "numbers") }
+func BenchmarkJsoniterRandom(b *testing.B)         { benchmarkJsoniter(b, "random") }
+func BenchmarkJsoniterTwitter(b *testing.B)        { benchmarkJsoniter(b, "twitter") }
+func BenchmarkJsoniterTwitterescaped(b *testing.B) { benchmarkJsoniter(b, "twitterescaped") }
+func BenchmarkJsoniterUpdate_center(b *testing.B)  { benchmarkJsoniter(b, "update-center") }
